@@ -34,7 +34,8 @@ class AsyncImageWriter:
             return
             
         # Submit to thread pool - fire and forget
-        cls._executor.submit(cls._write, filepath, image.copy(), quality)
+        # OPTIMIZATION: Removed .copy() to prevent double copy. Caller must ensure image safety.
+        cls._executor.submit(cls._write, filepath, image, quality)
     
     @staticmethod
     def _write(filepath, image, quality):
