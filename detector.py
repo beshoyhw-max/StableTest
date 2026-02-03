@@ -6,6 +6,7 @@ import datetime
 from ultralytics import YOLO
 import threading
 from sleep_detector import SleepDetector
+from async_sleep_worker import AsyncSleepWorker
 import torch
 import numpy as np
 class PhoneDetector:
@@ -59,6 +60,11 @@ class PhoneDetector:
         else:
             self.sleep_detector = SleepDetector(pose_model_path=pose_model_path, lock=lock)
         print("  → Sleep detector initialized")
+        
+        # Initialize async sleep worker (moves MediaPipe off main loop)
+        self.async_sleep_worker = AsyncSleepWorker(self.sleep_detector)
+        self.async_sleep_worker.start()
+        print("  → Async sleep worker started")
 
         # Initialize face recognition if enabled
         self.face_recognizer = None
@@ -333,7 +339,7 @@ class PhoneDetector:
                 is_sleeping = False
                 
                 if not has_phone and enable_sleep_detection:
-                    # Check for sleep
+                    # Check for sleep (ASYNC: enqueue + cache lookup)
                     h, w, _ = frame.shape
                     pad = 20
                     cx1 = max(0, x1 - pad)
@@ -343,17 +349,16 @@ class PhoneDetector:
                     person_crop = frame[cy1:cy2, cx1:cx2]
                     
                     if person_crop.size > 0:
-                        # FIXED: Use Person Name if available (Stable), otherwise used ID (Unstable)
+                        # Use Person Name if available (Stable), otherwise use ID (Unstable)
                         person_name = self.person_identities.get(track_id, None)
                         if person_name:
                             sleep_key = f"{camera_name}_{person_name}"
-                            # if frame_count % 30 == 0: print(f"DEBUG: Using STABLE key: {sleep_key}")
                         else:
                             sleep_key = f"{camera_name}_id_{track_id}"
-                            # if frame_count % 30 == 0: print(f"DEBUG: Using ID key: {sleep_key}")
                         kpts = pose_keypoints_map.get(track_id)
                         
-                        sleep_status, sleep_details = self.sleep_detector.process_crop(
+                        # ASYNC PATTERN: Enqueue for background processing
+                        self.async_sleep_worker.enqueue(
                             person_crop,
                             id_key=sleep_key,
                             keypoints=kpts,
@@ -361,7 +366,14 @@ class PhoneDetector:
                             sensitivity=sleep_sensitivity
                         )
                         
-                        if sleep_status in ("sleeping", "drowsy"):
+                        # Read cached result (instant, non-blocking)
+                        cached_status, cached_details = self.async_sleep_worker.get_sleep_status(sleep_key)
+                        
+                        # DEBUG: Trace sleep detection flow (teee only)
+                        if frame_count % 30 == 0 and cached_status and sleep_key.startswith("teee"):
+                            print(f"  [DEBUG] {sleep_key}: cached={cached_status}")
+                        
+                        if cached_status in ("sleeping", "drowsy"):
                             is_sleeping = True
                 
                 # DEBUG: Check if phone is blocking sleep
