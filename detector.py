@@ -67,9 +67,14 @@ class PhoneDetector:
         if enable_face_recognition:
             try:
                 from face_recognizer import FaceRecognizer
+                from async_face_worker import AsyncFaceWorker
+                
                 self.face_recognizer = FaceRecognizer()
+                self.async_face_worker = AsyncFaceWorker(self.face_recognizer)
+                self.async_face_worker.start()
+                
                 num_people = len(self.face_recognizer.list_known_people())
-                print(f"  → Face recognition ENABLED")
+                print(f"  → Face recognition ENABLED (Async Mode)")
                 print(f"     • Registered people: {num_people}")
                 if num_people > 0:
                     print(f"     • Names: {', '.join(self.face_recognizer.list_known_people())}")
@@ -77,6 +82,7 @@ class PhoneDetector:
                 print(f"  → Face recognition initialization failed: {e}")
                 print(f"  → Continuing without face recognition")
                 self.face_recognizer = None
+                self.async_face_worker = None
 
         self.PHONE_CLASS_ID = 67
         self.PERSON_CLASS_ID = 0
@@ -250,13 +256,61 @@ class PhoneDetector:
                 person_boxes, phone_boxes, pose_keypoints_map
             )
 
-            # 4. Face Recognition - Clean Production Version
+            # 4. Face Recognition - Async Version
             if self.face_recognizer:
                 # Periodically refresh threshold from shared config
                 if current_time - self.last_threshold_check > self.threshold_check_interval:
                     self.face_recognizer.threshold = self.face_recognizer.get_shared_threshold()
                     self.last_threshold_check = current_time
-                
+
+                # A. PROCESS RESULTS from Background Worker
+                for res in self.async_face_worker.get_results():
+                    track_id = res['track_id']
+                    person_name = res['name']
+                    confidence = res['conf']
+                    
+                    if person_name != "Unknown" and confidence >= self.identity_min_confidence:
+                        old_name = self.person_identities.get(track_id, "Unknown")
+                        self.person_identities[track_id] = person_name
+                        self.identity_confidences[track_id] = confidence
+                        
+                        # Reset missed count on success
+                        self.identity_missed_counts[track_id] = 0
+                        
+                        if old_name != person_name:
+                            print(f"  ✓ ID {track_id}: {person_name} ({confidence:.3f})")
+                        
+                        # Update attendance tracker with recognized person
+                        # NOTE: This is safe to call here as it just updates a dict (fast)
+                        if self.attendance_tracker:
+                            # We need to find the current box for this track_id to invoke update_person
+                            # This is a bit tricky since the result is async.
+                            # We will use the 'last known box' from the current frame if available
+                            current_box = None
+                            for pb in person_boxes:
+                                if int(pb[4]) == track_id:
+                                    current_box = pb[:4]
+                                    break
+                            
+                            if current_box is not None:
+                                self.attendance_tracker.update_person(
+                                    person_name, current_box, frame, camera_name
+                                )
+                    else:
+                        # Not recognized (Unknown or low confidence)
+                        # Increment missed count if we thought we knew who this was
+                        if track_id in self.person_identities:
+                            misses = self.identity_missed_counts.get(track_id, 0) + 1
+                            self.identity_missed_counts[track_id] = misses
+                            
+                            if misses >= self.identity_miss_threshold:
+                                removed_name = self.person_identities.pop(track_id, "Unknown")
+                                self.identity_confidences.pop(track_id, None)
+                                self.identity_missed_counts[track_id] = 0
+                                print(f"  ✕ ID {track_id}: Identity '{removed_name}' dropped (failed {misses} verifications)")
+
+
+                # B. QUEUE NEW REQUESTS
                 for p_box in person_boxes:
                     x1, y1, x2, y2, track_id = p_box
                     
@@ -265,63 +319,8 @@ class PhoneDetector:
                                    current_time - last_check > self.identity_check_interval)
                     
                     if should_check:
-                        try:
-                            h, w = frame.shape[:2]
-                            person_height = y2 - y1
-                            person_width = x2 - x1
-                            
-                            # Adaptive padding for distant people
-                            if person_height < 200:
-                                pad_x = int(person_width * 0.3)
-                                pad_y = int(person_height * 0.3)
-                            else:
-                                pad_x = int(person_width * 0.15)
-                                pad_y = int(person_height * 0.15)
-                            
-                            fx1 = max(0, int(x1 - pad_x))
-                            fy1 = max(0, int(y1 - pad_y))
-                            fx2 = min(w, int(x2 + pad_x))
-                            fy2 = min(h, int(y2 + pad_y))
-                            
-                            person_name, confidence = self.face_recognizer.recognize_face(
-                                frame, (fx1, fy1, fx2, fy2)
-                            )
-                            
-                            self.identity_last_check[track_id] = current_time
-                            
-                            
-                            if person_name != "Unknown" and confidence >= self.identity_min_confidence:
-                                old_name = self.person_identities.get(track_id, "Unknown")
-                                self.person_identities[track_id] = person_name
-                                self.identity_confidences[track_id] = confidence
-                                
-                                # Reset missed count on success
-                                self.identity_missed_counts[track_id] = 0
-                                
-                                if old_name != person_name:
-                                    print(f"  ✓ ID {track_id}: {person_name} ({confidence:.3f})")
-                                
-                                # Update attendance tracker with recognized person
-                                if self.attendance_tracker:
-                                    self.attendance_tracker.update_person(
-                                        person_name, (x1, y1, x2, y2), frame, camera_name
-                                    )
-                            else:
-                                # Not recognized (Unknown or low confidence)
-                                # Increment missed count if we thought we knew who this was
-                                if track_id in self.person_identities:
-                                    misses = self.identity_missed_counts.get(track_id, 0) + 1
-                                    self.identity_missed_counts[track_id] = misses
-                                    
-                                    if misses >= self.identity_miss_threshold:
-                                        removed_name = self.person_identities.pop(track_id, "Unknown")
-                                        self.identity_confidences.pop(track_id, None)
-                                        self.identity_missed_counts[track_id] = 0
-                                        print(f"  ✕ ID {track_id}: Identity '{removed_name}' dropped (failed {misses} verifications)")
-                                        
-                        except Exception as e:
-                            print(f"Face Rec Error: {e}")
-                            pass
+                         self.async_face_worker.enqueue_request(frame, (x1, y1, x2, y2), track_id, current_time)
+                         self.identity_last_check[track_id] = current_time
 
             # 5. Process each person with TIME-BASED logic
             current_detections = set()
@@ -506,9 +505,9 @@ class PhoneDetector:
             # Update previous gray frame for next optical flow step
             self.prev_gray = gray_frame
             
-            # Check for absences periodically
-            if self.attendance_tracker:
-                self.attendance_tracker.check_absences(frame, camera_name)
+            # Check for absences call REMOVED - Moved to CameraManager global loop
+            # if self.attendance_tracker:
+            #     self.attendance_tracker.check_absences(frame, camera_name)
             
             # Print FPS
             # fps = 1.0 / (time.time() - start_infer)

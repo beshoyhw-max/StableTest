@@ -399,6 +399,11 @@ class CameraManager:
         self._fps_monitor_running = True
         self._fps_monitor_thread = threading.Thread(target=self._fps_monitor_loop, daemon=True)
         self._fps_monitor_thread.start()
+        
+        # Start Absence Monitor thread (Independent of FPS debug)
+        self._absence_monitor_running = True
+        self._absence_monitor_thread = threading.Thread(target=self._absence_monitor_loop, daemon=True)
+        self._absence_monitor_thread.start()
 
     def load_config_and_start(self):
         if not os.path.exists(self.config_file):
@@ -560,10 +565,19 @@ class CameraManager:
         """Clear absence alerts."""
         self.attendance_tracker.clear_absence_alerts(person_name)
     
+    def _absence_monitor_loop(self):
+        """Dedicated background thread for absence detection (High Precision)."""
+        print("[System] Absence Monitor started (1s interval)")
+        while self._absence_monitor_running:
+            time.sleep(1.0)
+            if self.attendance_tracker:
+                self.attendance_tracker.check_absences(None, None)
+
     def _fps_monitor_loop(self):
         """Background thread that prints consolidated FPS for all cameras every 5 seconds."""
         while self._fps_monitor_running:
             time.sleep(5)
+            
             if not self.cameras:
                 continue
             
@@ -578,8 +592,9 @@ class CameraManager:
             print(f"[FPS] {fps_str} | Total: {total_fps:.1f}")
     
     def stop_fps_monitor(self):
-        """Stop the FPS monitor thread."""
+        """Stop the monitor threads."""
         self._fps_monitor_running = False
+        self._absence_monitor_running = False
 
     def get_camera_frame(self, camera_name):
         """
