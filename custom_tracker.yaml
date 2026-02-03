@@ -1,0 +1,10 @@
+# Custom ByteTrack configuration with extended buffer
+# Thresholds set low so app.py slider controls detection sensitivity
+
+tracker_type: bytetrack
+track_high_thresh: 0.1      # Set low - app.py slider controls actual detection threshold
+track_low_thresh: 0.05      # Set very low for second-chance matching  
+new_track_thresh: 0.1       # Set low - app.py slider controls what gets tracked
+track_buffer: 120          # Frames to keep lost tracks (~5 minutes at 30fps, ~3 min at 50fps)
+match_thresh: 0.6           # Matching threshold for association
+fuse_score: True            # Fuse detection score with IOU for matching
