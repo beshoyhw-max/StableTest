@@ -8,6 +8,7 @@ from mediapipe.tasks.python import vision
 from ultralytics import YOLO
 import os
 import torch
+from collections import deque
 class SleepDetector:
     def __init__(self, pose_model_path='yolo26s-pose.engine', 
                  mp_model_path='models/face_landmarker.task', 
@@ -119,10 +120,10 @@ class SleepDetector:
         if id_key not in self.state:
             self.state[id_key] = {
                 'last_seen': current_time,
-                'head_positions': [],
-                'ear_history': [],           # For dynamic threshold
-                'ear_closed_history': [],    # Boolean: was eye closed? (for PERCLOS)
-                'recent_states': [],         # For temporal smoothing
+                'head_positions': deque(maxlen=self.MOTION_BUFFER_SIZE),
+                'ear_history': [],           # For dynamic threshold (kept as list for numpy/slicing)
+                'ear_closed_history': deque(maxlen=self.PERCLOS_WINDOW),    # Boolean: was eye closed? (for PERCLOS)
+                'recent_states': deque(maxlen=self.SMOOTHING_WINDOW),         # For temporal smoothing
                 'last_active_time': current_time,
             }
 
@@ -228,8 +229,6 @@ class SleepDetector:
                         nose_landmark.y * crop.shape[0]
                     )
                     state['head_positions'].append(nose_position)
-                    if len(state['head_positions']) > self.MOTION_BUFFER_SIZE:
-                        state['head_positions'].pop(0)
 
                     # Calculate EAR
                     try:
@@ -313,8 +312,6 @@ class SleepDetector:
                     
                     # Track for PERCLOS
                     state['ear_closed_history'].append(eye_closed)
-                    if len(state['ear_closed_history']) > self.PERCLOS_WINDOW:
-                        state['ear_closed_history'].pop(0)
                     
                     # Calculate PERCLOS
                     if len(state['ear_closed_history']) >= 10:  # Need minimum samples
@@ -367,8 +364,6 @@ class SleepDetector:
             if posture_signals.get('is_writing', False):
                 state['last_active_time'] = current_time
                 state['recent_states'].append('awake')
-                if len(state['recent_states']) > self.SMOOTHING_WINDOW:
-                    state['recent_states'].pop(0)
                 return "awake", {"score": 0.0, "reason": "writing_detected", "source": "yolo-pose"}
             
             details['posture'] = posture_signals
@@ -398,8 +393,6 @@ class SleepDetector:
 
         # === TEMPORAL SMOOTHING ===
         state['recent_states'].append(raw_state)
-        if len(state['recent_states']) > self.SMOOTHING_WINDOW:
-            state['recent_states'].pop(0)
         
         # Majority voting for smoothed state
         if len(state['recent_states']) >= 5:

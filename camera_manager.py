@@ -376,30 +376,22 @@ class CameraManager:
         )
         
         print("=" * 70)
-        print("Initializing Camera Manager - SHARED MODEL ARCHITECTURE")
+        print("Initializing Camera Manager - FULLY PARALLEL ARCHITECTURE")
         print("=" * 70)
         
         print("=" * 70)
-        print("Initializing Camera Manager - HYBRID ARCHITECTURE")
-        print("1. Detection/Tracking: PRIVATE models (Accurate IDs)")
-        print("2. Pose Estimation: SHARED model (Memory Efficient)")
+        print("Initializing Camera Manager - INDEPENDENT ARCHITECTURE")
+        print("1. Detection/Tracking: PRIVATE models per camera (No Locking)")
+        print("2. Pose Estimation: PRIVATE models per camera (No Locking)")
         print("=" * 70)
         
-        # --- SHARED MODELS (PERFORMANCE FIX) ---
+        # --- FULLY PARALLEL (PERFORMANCE FIX) ---
         self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
         
-        # NOTE: Removed shared_model for detection to fix tracking issues
-        
-        print(f"Loading Shared Pose Model on {self.device}...")
-        self.shared_pose_model = YOLO('yolo26s-pose.engine')
-        # TensorRT models don't support .to(device)
-        
-        self.model_lock = threading.Lock()
+        # NOTE: No shared models. Each camera loads its own.
+        # This maximizes parallelism at the cost of VRAM (safe for 4GB cards).
         
         self.global_sleep_sensitivity = 0.18 # Default safe value
-        
-        print("Shared pose model loaded. Starting cameras...")
-        print("=" * 70)
         
         self.load_config_and_start()
         
@@ -447,9 +439,9 @@ class CameraManager:
             reset_gap=self.global_reset_gap,
             skip_frames=self.global_skip_frames,
             enable_face_recognition=self.global_face_recognition,
-            shared_model=None, # No longer sharing detection model
-            shared_pose_model=self.shared_pose_model,
-            model_lock=self.model_lock,
+            shared_model=None, 
+            shared_pose_model=None, # Private models now
+            model_lock=None, # No locking needed
             sleep_sensitivity=self.global_sleep_sensitivity,
             attendance_tracker=self.attendance_tracker,
             shared_cooldowns=self.shared_cooldowns,

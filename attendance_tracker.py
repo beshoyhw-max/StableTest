@@ -255,7 +255,9 @@ class AttendanceTracker:
         filename = f"absence_{safe_cam_name}_{timestamp_fn}_{safe_person_name}.jpg"
         filepath = os.path.join(target_folder, filename)
         
-        cv2.imwrite(filepath, evidence_img)
+        # Use async writer to prevent blocking
+        from async_image_writer import AsyncImageWriter
+        AsyncImageWriter.save(filepath, evidence_img)
         print(f"[EVIDENCE] ABSENCE: {filepath}")
     
     def get_absent_people(self):

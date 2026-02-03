@@ -36,18 +36,22 @@ class PhoneDetector:
             os.makedirs(self.output_dir)
 
         # Load models
-        self.lock = lock
+        # OPTIMIZATION: Split lock into detection and pose locks
+        # If model_instance is None (Private Model), we DO NOT LOCK detection -> Parallel Inference!
+        self.pose_lock = lock
         
         if model_instance:
             print("  → Using shared detection model (with lock)")
             self.model = model_instance
+            self.detection_lock = lock
         else:
             print(f"  → Loading private detection model from {model_path}")
             self.model = YOLO(model_path, task='detect')
             # TensorRT models don't support .to(device)
             if model_path.endswith('.pt'):
                 self.model.to(self.device)
-            print("  → Private detection model loaded")
+            print("  → Private detection model loaded - PARALLEL INFERENCE ENABLED")
+            self.detection_lock = None # Explicitly unlock private model usage
             
         print("  → Initializing sleep detector...")
         if pose_model_instance:
@@ -176,8 +180,8 @@ class PhoneDetector:
             # 1. Detection + Tracking
             classes_to_track = [self.PERSON_CLASS_ID, self.PHONE_CLASS_ID]
             
-            if self.lock:
-                with self.lock:
+            if self.detection_lock:
+                with self.detection_lock:
                     results = self.model.track(frame, classes=classes_to_track, 
                                              conf=conf_threshold, persist=True, 
                                              verbose=False, imgsz=1280, device=self.device,
@@ -225,8 +229,8 @@ class PhoneDetector:
             pose_keypoints_map = {}
             if hasattr(self.sleep_detector, 'pose_model'):
                 try:
-                    if self.lock:
-                        with self.lock:
+                    if self.pose_lock:
+                        with self.pose_lock:
                             pose_results = self.sleep_detector.pose_model(frame, verbose=False, conf=0.5)
                     else:
                         pose_results = self.sleep_detector.pose_model(frame, verbose=False, conf=0.5)
@@ -858,5 +862,6 @@ class PhoneDetector:
         
         filename = os.path.join(target_folder, filename_base)
         
-        cv2.imwrite(filename, evidence_img)
+        from async_image_writer import AsyncImageWriter
+        AsyncImageWriter.save(filename, evidence_img)
         print(f"📸 EVIDENCE SAVED: {filename} (Duration: {duration})")
