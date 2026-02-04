@@ -32,14 +32,9 @@ class AsyncFaceWorker:
     def enqueue_request(self, frame, bbox, track_id, timestamp):
         """
         Submit a face recognition request.
-        Request is ignored if queue is full or if we already have a pending request for this ID (debounce).
+        Request is dropped if queue is full after 10ms wait (smooths jitter).
         """
         if not self.running:
-            return
-
-        # Simple debounce: Don't queue if we just queued this ID recently (< 0.5s)
-        # Note: Caller usually handles "check interval", this is a safety net for the queue
-        if self.request_queue.full():
             return
             
         # Create a copy of the ROI to ensure thread safety with the image data directly
@@ -62,12 +57,16 @@ class AsyncFaceWorker:
             # Adjust bbox to be relative to the roi
             adj_bbox = (x1 - ctx1, y1 - cty1, x2 - ctx1, y2 - cty1)
             
-            self.request_queue.put({
-                'frame': frame_roi, 
-                'bbox': adj_bbox, 
-                'track_id': track_id,
-                'request_ts': timestamp
-            })
+            try:
+                # Use timeout instead of block=False for smoother jitter handling
+                self.request_queue.put({
+                    'frame': frame_roi, 
+                    'bbox': adj_bbox, 
+                    'track_id': track_id,
+                    'request_ts': timestamp
+                }, timeout=0.01)  # Wait 10ms before dropping
+            except queue.Full:
+                pass  # Silently drop if queue still full after timeout
 
     def get_results(self):
         """Yields all available results from the queue."""

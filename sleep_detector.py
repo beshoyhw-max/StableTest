@@ -288,7 +288,7 @@ class SleepDetector:
                                 state['is_calibrated'] = True
                                 # Trim history back to rolling window
                                 state['ear_history'] = state['ear_history'][-300:]
-                                print(f"  [SleepDetector] Calibrated {id_key}: {final_threshold:.3f} ({details['status']})")
+                                pass  # Calibration complete
                             
                             # During calibration, use user setting (allows manual low override)
                             current_threshold = sensitivity 
@@ -313,12 +313,23 @@ class SleepDetector:
                     # Track for PERCLOS
                     state['ear_closed_history'].append(eye_closed)
                     
+                    # FAST RESET: If eyes are OPEN, aggressively clear PERCLOS history
+                    # This prevents "sticky" drowsy state after opening eyes
+                    if not eye_closed:
+                        # Clear most of the history, keep only last few frames
+                        while len(state['ear_closed_history']) > 5:
+                            state['ear_closed_history'].popleft()
+                    
                     # Calculate PERCLOS
                     if len(state['ear_closed_history']) >= 10:  # Need minimum samples
                         closed_count = sum(state['ear_closed_history'])
                         perclos = closed_count / len(state['ear_closed_history'])
                         signals['perclos_high'] = perclos >= self.PERCLOS_DROWSY
                         details['perclos'] = perclos
+                    else:
+                        # Not enough samples after reset - assume awake
+                        signals['perclos_high'] = False
+                        details['perclos'] = 0.0
                     
                     # Head stillness (REMOVED)
                     # is_head_still = False # self._is_head_still_normalized(state['head_positions'], crop.shape)
@@ -328,8 +339,7 @@ class SleepDetector:
                     details['threshold'] = current_threshold
                     details['source'] = 'mediapipe'
                     
-            except Exception as e:
-                # print(f"MP Error: {e}")
+            except Exception:
                 pass  # Fall through to posture check
 
         # --- SIGNAL 3, 4, 5: Posture Analysis (YOLO Pose) ---
@@ -393,6 +403,16 @@ class SleepDetector:
 
         # === TEMPORAL SMOOTHING ===
         state['recent_states'].append(raw_state)
+        
+        # FAST RESET: If score is exactly 0 (NO signals), immediately return awake
+        # This prevents "sticky" drowsy state when user opens eyes
+        if score == 0.0:
+            state['recent_states'].clear()
+            state['recent_states'].append('awake')
+            details['raw_state'] = 'awake'
+            details['smoothed_state'] = 'awake'
+            details['score'] = 0.0
+            return 'awake', details
         
         # Majority voting for smoothed state
         if len(state['recent_states']) >= 5:
