@@ -1,0 +1,10 @@
+{
+  "conf_threshold": 0.25,
+  "phone_duration": 5,
+  "sleep_duration": 10,
+  "cooldown_duration": 120,
+  "absence_threshold": 300,
+  "skip_frames": 5,
+  "sleep_sensitivity": 0.18,
+  "timestamp": 1770537647.4818501
+}

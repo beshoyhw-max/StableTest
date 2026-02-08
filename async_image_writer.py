@@ -49,15 +49,10 @@ class AsyncImageWriter:
                 os.makedirs(directory, exist_ok=True)
             
             # Write image
-            start_time = time.time()
             success = cv2.imwrite(filepath, image, [cv2.IMWRITE_JPEG_QUALITY, quality])
             
             if not success:
                 print(f"[AsyncImageWriter] ❌ Failed to write {filepath} (cv2 returned False)")
-            
-            # Optional: Uncomment for debugging performance
-            # elapsed = (time.time() - start_time) * 1000
-            # print(f"[AsyncImageWriter] ✓ Saved {os.path.basename(filepath)} in {elapsed:.1f}ms")
             
         except Exception as e:
             print(f"[AsyncImageWriter] ❌ Error saving {filepath}: {e}")

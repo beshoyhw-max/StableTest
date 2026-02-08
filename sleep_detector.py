@@ -101,6 +101,36 @@ class SleepDetector:
         # Per-person state tracking
         self.state = {}
 
+    def cleanup_state(self, active_keys):
+        """
+        Remove state for keys that are no longer active.
+        Fixes memory leak by preventing infinite growth of self.state.
+        
+        Args:
+            active_keys (set): Set of currently detected keys (names or IDs)
+        """
+        # Identify stale keys (in state but not in active_keys)
+        # We keep them for a short grace period (handled by caller or just simple set diff here)
+        # For safety, we only remove keys that have not been updated in a long time
+        # OR we fundamentally trust the active_keys list.
+        
+        current_time = time.time()
+        keys_to_remove = []
+        
+        for key, data in self.state.items():
+            # If key is effectively gone (not active) AND hasn't been seen for 30 seconds
+            if key not in active_keys:
+                last_seen = data.get('last_seen', 0)
+                if current_time - last_seen > 30.0:
+                    keys_to_remove.append(key)
+        
+        for key in keys_to_remove:
+            del self.state[key]
+            
+        if keys_to_remove:
+            # print(f"[SleepDetector] Cleaned up {len(keys_to_remove)} stale states")
+            pass
+
     def process_crop(self, crop, id_key="unknown", keypoints=None, crop_origin=(0,0), sensitivity=0.18):
         """
         Process person crop for sleep/drowsiness detection.
@@ -112,9 +142,23 @@ class SleepDetector:
         if crop.size == 0:
             return "awake", {"score": 0.0, "reason": "empty_crop"}
 
-
-
         current_time = time.time()
+        
+        # === AUTOMATIC CLEANUP (prevents OOM from ghost IDs) ===
+        # Run every ~100 calls to avoid overhead
+        if not hasattr(self, '_cleanup_counter'):
+            self._cleanup_counter = 0
+        self._cleanup_counter += 1
+        
+        if self._cleanup_counter >= 100:
+            self._cleanup_counter = 0
+            # Remove states not seen in 30 seconds
+            stale_keys = [k for k, v in self.state.items() 
+                         if current_time - v.get('last_seen', 0) > 30.0]
+            for k in stale_keys:
+                del self.state[k]
+            if stale_keys:
+                print(f"[SleepDetector] Cleaned {len(stale_keys)} stale states. Active: {len(self.state)}")
 
         # Initialize state for new person
         if id_key not in self.state:
@@ -288,7 +332,7 @@ class SleepDetector:
                                 state['is_calibrated'] = True
                                 # Trim history back to rolling window
                                 state['ear_history'] = state['ear_history'][-300:]
-                                print(f"  [SleepDetector] Calibrated {id_key}: {final_threshold:.3f} ({details['status']})")
+                                pass  # Calibration complete
                             
                             # During calibration, use user setting (allows manual low override)
                             current_threshold = sensitivity 
@@ -313,12 +357,23 @@ class SleepDetector:
                     # Track for PERCLOS
                     state['ear_closed_history'].append(eye_closed)
                     
+                    # FAST RESET: If eyes are OPEN, aggressively clear PERCLOS history
+                    # This prevents "sticky" drowsy state after opening eyes
+                    if not eye_closed:
+                        # Clear most of the history, keep only last few frames
+                        while len(state['ear_closed_history']) > 5:
+                            state['ear_closed_history'].popleft()
+                    
                     # Calculate PERCLOS
                     if len(state['ear_closed_history']) >= 10:  # Need minimum samples
                         closed_count = sum(state['ear_closed_history'])
                         perclos = closed_count / len(state['ear_closed_history'])
                         signals['perclos_high'] = perclos >= self.PERCLOS_DROWSY
                         details['perclos'] = perclos
+                    else:
+                        # Not enough samples after reset - assume awake
+                        signals['perclos_high'] = False
+                        details['perclos'] = 0.0
                     
                     # Head stillness (REMOVED)
                     # is_head_still = False # self._is_head_still_normalized(state['head_positions'], crop.shape)
@@ -328,8 +383,7 @@ class SleepDetector:
                     details['threshold'] = current_threshold
                     details['source'] = 'mediapipe'
                     
-            except Exception as e:
-                # print(f"MP Error: {e}")
+            except Exception:
                 pass  # Fall through to posture check
 
         # --- SIGNAL 3, 4, 5: Posture Analysis (YOLO Pose) ---
@@ -393,6 +447,16 @@ class SleepDetector:
 
         # === TEMPORAL SMOOTHING ===
         state['recent_states'].append(raw_state)
+        
+        # FAST RESET: If score is exactly 0 (NO signals), immediately return awake
+        # This prevents "sticky" drowsy state when user opens eyes
+        if score == 0.0:
+            state['recent_states'].clear()
+            state['recent_states'].append('awake')
+            details['raw_state'] = 'awake'
+            details['smoothed_state'] = 'awake'
+            details['score'] = 0.0
+            return 'awake', details
         
         # Majority voting for smoothed state
         if len(state['recent_states']) >= 5:

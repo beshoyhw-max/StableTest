@@ -29,6 +29,9 @@ class VideoReader:
         self.running = False
         self.connected = False
         
+        # Thread-safe frame access lock (fixes race condition)
+        self.frame_lock = threading.Lock()
+        
         self.thread = threading.Thread(target=self.update, args=(), daemon=True)
         
     def start(self):
@@ -94,14 +97,13 @@ class VideoReader:
             try:
                 ret, frame = self.cap.read()
                 if ret:
-                    self.frame = frame
-                    self.last_read_time = time.time()
+                    with self.frame_lock:
+                        self.frame = frame
+                        self.last_read_time = time.time()
                     
                     # FPS Calculation
                     self.fps_frame_count += 1
                     if time.time() - self.fps_start_time > 1.0:
-                        fps = self.fps_frame_count / (time.time() - self.fps_start_time)
-                        # print(f"DEBUG: [{self.camera_name}] Camera Source FPS: {fps:.1f}")
                         self.fps_frame_count = 0
                         self.fps_start_time = time.time()
 
@@ -119,7 +121,6 @@ class VideoReader:
                             pass
                     
                     # For streams/cameras: reconnect
-                    # print(f"[{self.camera_name}] Stream read failed.")
                     if self.cap:
                         try:
                             self.cap.release()
@@ -141,7 +142,9 @@ class VideoReader:
                 time.sleep(1)
 
     def get_frame(self):
-        return self.frame, self.last_read_time
+        with self.frame_lock:
+            frame_copy = self.frame.copy() if self.frame is not None else None
+            return frame_copy, self.last_read_time
         
     def is_connected(self):
         return self.connected and (time.time() - self.last_read_time < 3.0)
@@ -346,13 +349,327 @@ class CameraThread(threading.Thread):
              self.detector.reset_gap = reset_gap
 
 
+class MPCameraThread(threading.Thread):
+    """
+    Multiprocessing-based camera processor.
+    
+    Uses a separate OS process for PhoneDetector to bypass Python's GIL.
+    VideoReader runs in main process (I/O bound), detector runs in child process (CPU bound).
+    
+    Provides the same interface as CameraThread for easy swapping.
+    """
+    
+    def __init__(self, camera_config, conf_threshold=0.25, 
+                 phone_duration=5.0, sleep_duration=10.0, cooldown_duration=120.0,
+                 reset_gap=2.5, skip_frames=5, enable_face_recognition=False,
+                 shared_model=None, shared_pose_model=None, model_lock=None,
+                 sleep_sensitivity=0.18, attendance_tracker=None,
+                 shared_cooldowns=None, shared_cooldowns_lock=None):
+        """
+        Initialize multiprocessing camera thread.
+        Same parameters as CameraThread for compatibility.
+        """
+        super().__init__()
+        self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
+        self.camera_id = camera_config['id']
+        self.camera_name = camera_config['name']
+        self.source = camera_config['source']
+        
+        # Store config for passing to detector process
+        self.detector_config = {
+            'conf_threshold': conf_threshold,
+            'phone_duration': phone_duration,
+            'sleep_duration': sleep_duration,
+            'cooldown_duration': cooldown_duration,
+            'reset_gap': reset_gap,
+            'skip_frames': skip_frames,
+            'enable_face_recognition': enable_face_recognition,
+            'sleep_sensitivity': sleep_sensitivity,
+            'shared_cooldowns': shared_cooldowns  # Pass for cross-camera dedup
+        }
+        
+        self.conf_threshold = conf_threshold
+        self.phone_duration = phone_duration
+        self.sleep_duration = sleep_duration
+        self.cooldown_duration = cooldown_duration
+        self.skip_frames = skip_frames
+        self.sleep_sensitivity = sleep_sensitivity
+        
+        # State
+        self.running = False
+        self.status = "initializing"
+        self.last_update_time = time.time()
+        self._processed_fps = 0.0
+        
+        # Cached display data for drawing
+        self._display_data = []
+        self._display_data_lock = threading.Lock()
+        
+        # Frame cache: store the LAST submitted frame only
+        # This is the safest approach for memory (OOM prevention)
+        self._last_submitted_frame = None
+        
+        # Track last processed result to avoid redundant updates
+        self._last_result_timestamp = 0.0
+        
+        # Process restart tracking (to prevent infinite restart loops leaks)
+        self._process_start_time = 0
+        self._retry_count = 0
+        
+        # Attendance tracker reference (used in main process only)
+        self.attendance_tracker = attendance_tracker
+        self.shared_cooldowns = shared_cooldowns
+        self.shared_cooldowns_lock = shared_cooldowns_lock
+        
+        # Video reader (runs in this thread, I/O bound)
+        self.reader = VideoReader(self.source, self.camera_name)
+        
+        # MP Worker (detector runs in separate process)
+        from mp_detector_worker import MPDetectorWorker
+        self.mp_worker = MPDetectorWorker(
+            camera_name=self.camera_name,
+            camera_id=self.camera_id,
+            config=self.detector_config
+        )
+        
+        print(f"[MP-{self.camera_name}] Initialized with multiprocessing detector")
+    
+    def run(self):
+        """Main processing loop."""
+        self.running = True
+        print(f"[MP-{self.camera_name}] Starting processing...")
+        
+        # Start video reader
+        self.reader.start()
+        
+        # Start detector process
+        self.mp_worker.start()
+        
+        # Wait a moment for detector to initialize
+        time.sleep(2.0)
+        
+        frame_count = 0
+        last_timestamp = 0
+        
+        while self.running:
+            # Check if detector process is alive
+            if not self.mp_worker.is_alive():
+                current_time = time.time()
+                # Check for rapid restart loops (e.g. crash immediately on start)
+                if current_time - self._process_start_time < 10.0:
+                    self._retry_count += 1
+                    if self._retry_count > 5:
+                        print(f"[MP-{self.camera_name}] FATAL: Detector crashing repeatedly. Stopping camera.")
+                        self.status = "error_crash_loop"
+                        self.running = False
+                        break
+                else:
+                    self._retry_count = 0  # Reset if stable for >10s
+                
+                print(f"[MP-{self.camera_name}] Detector process died! Restarting (Attempt {self._retry_count})...")
+                
+                # CRITICAL FIX: Cannot restart a dead process object. Must create a NEW instance.
+                try:
+                    # Try to clean up the old one if it's still hanging around
+                    if self.mp_worker:
+                        self.mp_worker.terminate()
+                        self.mp_worker.join(timeout=0.1)
+                except Exception as e:
+                    print(f"[MP-{self.camera_name}] Warning during cleanup: {e}")
+
+                # Create NEW process instance
+                from mp_detector_worker import MPDetectorWorker
+                self.mp_worker = MPDetectorWorker(
+                    camera_name=self.camera_name,
+                    camera_id=self.camera_id,
+                    config=self.detector_config
+                )
+                
+                self._process_start_time = time.time()
+                self.mp_worker.start()
+                time.sleep(2.0)
+                continue
+            
+            if not self.reader.is_connected():
+                self.status = "disconnected"
+                time.sleep(0.5)
+                continue
+            
+            # Get raw frame from video reader
+            raw_frame, timestamp = self.reader.get_frame()
+            
+            if raw_frame is None or timestamp == last_timestamp:
+                time.sleep(0.01)
+                continue
+            
+            last_timestamp = timestamp
+            
+            # Submit frame to detector process
+            self.mp_worker.submit_frame(raw_frame, frame_count)
+            
+            # Cache this frame for attendance tracking (simpler than full ring buffer)
+            # This PREVENTS OOM by ensuring we only hold 1 frame reference
+            self._last_submitted_frame = raw_frame.copy()
+            
+            # Get latest results (non-blocking)
+            result = self.mp_worker.get_result()
+            
+            if result:
+                self.status = result.get('status', 'safe')
+                self._processed_fps = result.get('fps', 0.0)
+                self.last_update_time = time.time()
+                
+                # Cache display data for drawing
+                with self._display_data_lock:
+                    self._display_data = result.get('display_data', [])
+                
+                # CRITICAL FIX: Update AttendanceTracker from child process results
+                # This bridges the gap since AttendanceTracker can't be shared across processes
+                recognized_persons = result.get('recognized_persons', [])
+                
+                # OOM FIX: Only update if this is a NEW result (check timestamp)
+                # Otherwise we re-process the same result 30x/sec and create excessive frame copies
+                result_ts = result.get('timestamp', 0)
+                if recognized_persons and self.attendance_tracker and result_ts > self._last_result_timestamp:
+                    self._last_result_timestamp = result_ts
+                    
+                    # Use the cached frame (close enough to the processed frame)
+                    cached_frame = self._last_submitted_frame if self._last_submitted_frame is not None else raw_frame
+                    
+                    for person in recognized_persons:
+                        name = person.get('name')
+                        box = person.get('box')
+                        conf = person.get('confidence', 1.0)
+                        if name and box:
+                            self.attendance_tracker.update_person(
+                                name, box, cached_frame, self.camera_name, conf
+                            )
+            
+            frame_count += 1
+            time.sleep(0.005)  # Prevent CPU spinning
+        
+        print(f"[MP-{self.camera_name}] Stopping...")
+        self.mp_worker.stop()
+        self.reader.stop()
+        print(f"[MP-{self.camera_name}] Stopped")
+    
+    def stop(self):
+        """Stop the camera processing."""
+        self.running = False
+        self.join(timeout=5.0)
+    
+    def get_frame(self):
+        """Get the latest processed frame (with detections drawn)."""
+        raw_frame = self.get_raw_frame()
+        if raw_frame is not None:
+            return self.draw_overlay_on_frame(raw_frame)
+        return None
+    
+    def get_status(self):
+        """Get current detection status."""
+        if time.time() - self.last_update_time > 8.0:
+            return "disconnected"
+        return self.status
+    
+    def get_fps(self):
+        """Get the source FPS of the video reader."""
+        if hasattr(self, 'reader') and self.reader:
+            return getattr(self.reader, 'fps', 30.0)
+        return 30.0
+    
+    def get_processed_fps(self):
+        """Get the actual processed FPS (inference rate)."""
+        return self._processed_fps
+    
+    def get_raw_frame(self):
+        """Get the latest raw frame directly from VideoReader."""
+        if hasattr(self, 'reader') and self.reader:
+            frame, _ = self.reader.get_frame()
+            return frame
+        return None
+    
+    def draw_overlay_on_frame(self, frame):
+        """Draw cached detection boxes on any frame."""
+        if frame is None:
+            return None
+        
+        output = frame.copy()
+        h, w = output.shape[:2]
+        
+        # Calculate dynamic scale
+        import cv2
+        scale_factor = max(w / 1280.0, h / 720.0)
+        box_thickness = max(2, int(3 * scale_factor))
+        font_scale = max(0.6, 0.8 * scale_factor)
+        font_thick = max(1, int(2 * scale_factor))
+        
+        with self._display_data_lock:
+            for data in self._display_data:
+                if len(data) >= 7:
+                    x1, y1, x2, y2, color, status, label = data[:7]
+                    
+                    # Draw box
+                    cv2.rectangle(output, (int(x1), int(y1)), (int(x2), int(y2)), color, box_thickness)
+                    
+                    # Draw label
+                    label_size, baseline = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, font_scale, font_thick)
+                    label_w, label_h = label_size
+                    
+                    pad_x = int(6 * scale_factor)
+                    pad_y = int(6 * scale_factor)
+                    
+                    label_y_top = int(y1) - pad_y
+                    if label_y_top - label_h < 0:
+                        label_y_top = int(y1) + label_h + pad_y + box_thickness
+                    
+                    bg_p1 = (int(x1), label_y_top - label_h - pad_y)
+                    bg_p2 = (int(x1) + label_w + pad_x * 2, label_y_top + pad_y)
+                    
+                    cv2.rectangle(output, bg_p1, bg_p2, color, -1)
+                    cv2.putText(output, label, (int(x1) + pad_x, label_y_top), 
+                               cv2.FONT_HERSHEY_SIMPLEX, font_scale, (255, 255, 255), font_thick)
+        
+        return output
+    
+    def update_thresholds(self, conf=None, phone_dur=None, sleep_dur=None, 
+                          cooldown=None, reset_gap=None, skip_frames=None, sleep_sensitivity=None):
+        """Update detection thresholds on the fly."""
+        if conf is not None:
+            self.conf_threshold = conf
+            self.mp_worker.update_conf_threshold(conf)
+        if sleep_sensitivity is not None:
+            self.sleep_sensitivity = sleep_sensitivity
+            self.mp_worker.update_sleep_sensitivity(sleep_sensitivity)
+        if phone_dur is not None:
+            self.phone_duration = phone_dur
+            self.mp_worker.update_phone_duration(phone_dur)
+        if sleep_dur is not None:
+            self.sleep_duration = sleep_dur
+            self.mp_worker.update_sleep_duration(sleep_dur)
+        if skip_frames is not None:
+            self.skip_frames = skip_frames
+            self.mp_worker.update_skip_frames(skip_frames)
+        if cooldown is not None:
+            self.cooldown_duration = cooldown
+            self.mp_worker.update_cooldown(cooldown)
+        if reset_gap is not None:
+            self.mp_worker.update_reset_gap(reset_gap)
+
+
 class CameraManager:
-    def __init__(self, config_file="cameras.json"):
+    def __init__(self, config_file="cameras.json", use_multiprocessing=False, mp_shared_cooldowns=None):
         """
         Camera Manager with TIME-BASED detection configuration and face recognition.
+        
+        Args:
+            config_file: JSON file with camera configurations
+            use_multiprocessing: If True, use separate processes for detectors (bypasses GIL)
+                                 NOTE: Multiprocessing may not work well with Streamlit.
+                                 Default is False (threading mode) for compatibility.
         """
         self.config_file = config_file
         self.cameras = {}
+        self.use_multiprocessing = use_multiprocessing
         
         # Global thresholds
         self.global_conf = 0.25
@@ -365,10 +682,16 @@ class CameraManager:
         self.global_absence_threshold = 300.0  # Seconds (5 mins)
         
         # HYBRID COOLDOWN: Shared dict for recognized persons (global), local for unknown
-        self.shared_cooldowns = {}  # key: (person_name, status) -> last_save_time
-        self.shared_cooldowns_lock = threading.Lock()
+        # In multiprocessing mode, use Manager.dict() (process-safe, no lock needed)
+        # In threading mode, use regular dict with threading.Lock()
+        if use_multiprocessing and mp_shared_cooldowns is not None:
+            self.shared_cooldowns = mp_shared_cooldowns
+            self.shared_cooldowns_lock = None  # Manager.dict() is process-safe
+            print("[CameraManager] Using process-safe shared cooldowns (Manager.dict)")
+        else:
+            self.shared_cooldowns = {}  # key: (person_name, status) -> last_save_time
+            self.shared_cooldowns_lock = threading.Lock()
         
-        # Shared attendance tracker for global person monitoring
         # Shared attendance tracker for global person monitoring
         self.attendance_tracker = AttendanceTracker(
             absence_threshold_seconds=self.global_absence_threshold,
@@ -376,22 +699,16 @@ class CameraManager:
         )
         
         print("=" * 70)
-        print("Initializing Camera Manager - FULLY PARALLEL ARCHITECTURE")
+        if use_multiprocessing:
+            print("Initializing Camera Manager - MULTIPROCESSING ARCHITECTURE")
+            print("Each camera detector runs in its OWN PROCESS (bypasses GIL)")
+        else:
+            print("Initializing Camera Manager - THREADING ARCHITECTURE")
+            print("Each camera detector runs in its own thread (GIL limited)")
         print("=" * 70)
         
-        print("=" * 70)
-        print("Initializing Camera Manager - INDEPENDENT ARCHITECTURE")
-        print("1. Detection/Tracking: PRIVATE models per camera (No Locking)")
-        print("2. Pose Estimation: PRIVATE models per camera (No Locking)")
-        print("=" * 70)
-        
-        # --- FULLY PARALLEL (PERFORMANCE FIX) ---
         self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
-        
-        # NOTE: No shared models. Each camera loads its own.
-        # This maximizes parallelism at the cost of VRAM (safe for 4GB cards).
-        
-        self.global_sleep_sensitivity = 0.18 # Default safe value
+        self.global_sleep_sensitivity = 0.18
         
         self.load_config_and_start()
         
@@ -419,8 +736,38 @@ class CameraManager:
         for conf in configs:
             self.add_camera_thread(conf)
 
+    def start_all_cameras(self):
+        """Restart all cameras from config file. Used when returning from production mode."""
+        # Stop any running cameras first
+        for cam_id, cam in list(self.cameras.items()):
+            try:
+                cam.stop()
+            except:
+                pass
+        self.cameras.clear()
+        
+        # Reload and start all cameras
+        self.load_config_and_start()
+        
+        # Restart monitor threads if they were stopped
+        if not self._fps_monitor_running:
+            self._fps_monitor_running = True
+            self._fps_monitor_thread = threading.Thread(target=self._fps_monitor_loop, daemon=True)
+            self._fps_monitor_thread.start()
+            print("[CameraManager] FPS monitor restarted")
+        
+        if not self._absence_monitor_running:
+            self._absence_monitor_running = True
+            self._absence_monitor_thread = threading.Thread(target=self._absence_monitor_loop, daemon=True)
+            self._absence_monitor_thread.start()
+            if self.attendance_tracker:
+                self.attendance_tracker.start()
+            print("[CameraManager] Absence monitor restarted")
+        
+        print("[CameraManager] All cameras restarted.")
+
     def add_camera_thread(self, config):
-        """Add a camera thread with current global thresholds."""
+        """Add a camera thread/process with current global thresholds."""
         source = config['source']
         if isinstance(source, str) and source.isdigit():
             source = int(source)
@@ -433,9 +780,14 @@ class CameraManager:
         
         print(f"\n{'='*60}")
         print(f"Starting Camera {cam_id}: {config['name']}")
+        mode_str = "MULTIPROCESSING" if self.use_multiprocessing else "THREADING"
+        print(f"Mode: {mode_str}")
         print(f"{'='*60}")
         
-        thread = CameraThread(
+        # Choose thread type based on configuration
+        ThreadClass = MPCameraThread if self.use_multiprocessing else CameraThread
+        
+        thread = ThreadClass(
             config,
             conf_threshold=self.global_conf,
             phone_duration=self.global_phone_duration,
@@ -445,8 +797,8 @@ class CameraManager:
             skip_frames=self.global_skip_frames,
             enable_face_recognition=self.global_face_recognition,
             shared_model=None, 
-            shared_pose_model=None, # Private models now
-            model_lock=None, # No locking needed
+            shared_pose_model=None,
+            model_lock=None,
             sleep_sensitivity=self.global_sleep_sensitivity,
             attendance_tracker=self.attendance_tracker,
             shared_cooldowns=self.shared_cooldowns,
@@ -595,6 +947,8 @@ class CameraManager:
         """Stop the monitor threads."""
         self._fps_monitor_running = False
         self._absence_monitor_running = False
+        if self.attendance_tracker:
+            self.attendance_tracker.stop()
 
     def get_camera_frame(self, camera_name):
         """
