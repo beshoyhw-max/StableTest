@@ -57,6 +57,7 @@ class FaceRecognizer:
         
         # Load database
         self.known_faces = self.load_database()
+        self._update_embeddings_cache()
         
         # Recognition threshold
         self.threshold = self.get_shared_threshold()
@@ -68,6 +69,22 @@ class FaceRecognizer:
         print(f"  → Known faces: {len(self.known_faces['names'])}")
         print(f"  → Recognition threshold: {self.threshold}")
         
+    def _update_embeddings_cache(self):
+        """Update the cached matrix of known embeddings for vectorized matching."""
+        if self.known_faces['embeddings']:
+            try:
+                # Stack and normalize embeddings for cosine similarity
+                stacked = np.vstack(self.known_faces['embeddings'])
+                norms = np.linalg.norm(stacked, axis=1, keepdims=True)
+                # Avoid division by zero
+                norms[norms == 0] = 1e-10
+                self.known_embeddings_matrix = stacked / norms
+            except Exception as e:
+                print(f"Error updating embeddings cache: {e}")
+                self.known_embeddings_matrix = None
+        else:
+            self.known_embeddings_matrix = None
+
     def load_database(self):
         if os.path.exists(self.database_path):
             try:
@@ -166,6 +183,7 @@ class FaceRecognizer:
                 message = f"Registered new face: {name}"
             
             self.save_database()
+            self._update_embeddings_cache()
             return True, message
             
         except Exception as e:
@@ -252,23 +270,28 @@ class FaceRecognizer:
             # Generate embedding
             query_embedding = self.recognizer.feature(aligned_face)
             
+            # Normalize query embedding
+            query_norm = np.linalg.norm(query_embedding)
+            if query_norm > 1e-10:
+                query_embedding = query_embedding / query_norm
+
             # Compare with known faces
             best_match = "Unknown"
             best_score = 0.0
             
-            for name, known_embedding in zip(
-                self.known_faces['names'], 
-                self.known_faces['embeddings']
-            ):
-                score = self.recognizer.match(
-                    query_embedding, 
-                    known_embedding,
-                    cv2.FaceRecognizerSF_FR_COSINE
-                )
+            if self.known_embeddings_matrix is not None:
+                # Vectorized cosine similarity
+                # known_embeddings_matrix: (N, 128)
+                # query_embedding: (1, 128)
+                # scores: (N,)
+                scores = np.matmul(self.known_embeddings_matrix, query_embedding.T).flatten()
+
+                best_idx = np.argmax(scores)
+                max_score = scores[best_idx]
                 
-                if score >= self.threshold and score > best_score:
-                    best_score = score
-                    best_match = name
+                if max_score >= self.threshold:
+                    best_score = float(max_score)
+                    best_match = self.known_faces['names'][best_idx]
             
             return best_match, best_score
             
@@ -329,6 +352,7 @@ class FaceRecognizer:
         del self.known_faces['embeddings'][idx]
         
         self.save_database()
+        self._update_embeddings_cache()
         return True, f"Removed {name} from database"
     
     def list_known_people(self):
