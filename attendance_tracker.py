@@ -40,30 +40,94 @@ class AttendanceTracker:
         
         print(f"  → AttendanceTracker initialized")
         print(f"     • Absence threshold: {absence_threshold_seconds} seconds")
+        self.active = True
+        self.last_check_time = time.time()
+
+    def stop(self):
+        """Stop tracking and suppress new alerts (used during shutdown)."""
+        self.active = False
+        
+    def start(self):
+        """Resume tracking (used when returning from production)."""
+        self.active = True
+        self.last_check_time = time.time()
+        # Clear old state to avoid immediate alerts
+        with self.lock:
+            self.tracked_people.clear()
+            self.absence_events.clear()
+
     
-    def update_person(self, person_name, box, frame, camera_name):
+    def update_person(self, person_name, box, frame, camera_name, confidence=1.0):
         """
         Called when a recognized person is detected in any camera.
-        Updates their last seen time and position.
+        Updates their last seen time and position using a Smart Hero Shot logic.
         
         Args:
             person_name: Name of the recognized person
             box: Tuple (x1, y1, x2, y2) bounding box
             frame: Current frame (will be copied for evidence)
             camera_name: Name of the camera where person was seen
+            confidence: Face recognition confidence (0.0 - 1.0)
         """
-        if not person_name or person_name == "Unknown":
+        if not self.active or not person_name or person_name == "Unknown":
             return
             
         current_time = time.time()
+        
+        # Calculate score: Box Area * Confidence
+        # This prioritizes LARGE faces that are also High Confidence (Frontal/Clear)
+        # Avoids back-of-head (low confidence) or tiny faces (low resolution)
+        x1, y1, x2, y2 = box
+        box_area = (x2 - x1) * (y2 - y1)
+        
+        current_score = box_area * confidence
+
+        # Prepare resized frame (Save RAM)
+        h, w = frame.shape[:2]
+        scale = min(640/w, 640/h)
+        if scale < 1.0:
+            small_frame = cv2.resize(frame, (int(w*scale), int(h*scale)))
+            # SCALE THE BOX TO MATCH THE RESIZED FRAME
+            sx1 = int(x1 * scale)
+            sy1 = int(y1 * scale)
+            sx2 = int(x2 * scale)
+            sy2 = int(y2 * scale)
+            stored_box = (sx1, sy1, sx2, sy2)
+        else:
+            small_frame = frame.copy()
+            stored_box = box
+
         
         with self.lock:
             if person_name in self.tracked_people:
                 person_data = self.tracked_people[person_name]
                 person_data["last_seen"] = current_time
-                person_data["last_box"] = box
-                person_data["last_frame"] = frame.copy()
                 person_data["last_camera"] = camera_name
+
+                # --- SMART HERO SHOT LOGIC ---
+                # Goal: Keep the "Best" face (largest box) from the last 2 seconds.
+                # This prevents overwriting a good face shot with a back-of-head shot 
+                # immediately before they leave, but ensures evidence isn't ancient.
+                
+                last_best_ts = person_data.get("last_best_ts", 0)
+                last_best_score = person_data.get("last_best_score", 0)
+                
+                # Check if the stored "best" frame is too old (> 2.0s)
+                # If it's old, we MUST update it (even if the new one is worse/back of head)
+                # to prove they were present recently.
+                is_window_expired = (current_time - last_best_ts) > 2.0
+                
+                # Is this new frame BETTER than the current cached one?
+                is_better_score = current_score > last_best_score
+                
+                if is_window_expired or is_better_score:
+                    # Update the evidence frame
+                    person_data["last_box"] = stored_box
+
+                    person_data["last_frame"] = small_frame
+                    person_data["last_best_score"] = current_score
+                    person_data["last_best_ts"] = current_time
+                    # Only update frame if we are updating the "best" logic
                 
                 # If they were absent and returned, reset status
                 if person_data["status"] == "absent":
@@ -78,10 +142,21 @@ class AttendanceTracker:
                     ]
             else:
                 # First time seeing this person
+                # SAFETY LIMIT: Prevent memory leaks from ghost detections (max 100 people)
+                if len(self.tracked_people) >= 100:
+                    # Remove oldest tracked person (FIFO)
+                    oldest_person = min(self.tracked_people.keys(), 
+                                      key=lambda k: self.tracked_people[k]["last_seen"])
+                    del self.tracked_people[oldest_person]
+                    print(f"  ⚠ AttendanceTracker limit reached. Removed oldest: {oldest_person}")
+
                 self.tracked_people[person_name] = {
                     "last_seen": current_time,
-                    "last_box": box,
-                    "last_frame": frame.copy(),
+                    "last_box": stored_box,
+
+                    "last_frame": small_frame,
+                    "last_best_score": current_score,
+                    "last_best_ts": current_time,
                     "last_camera": camera_name,
                     "status": "present",
                     "absence_notified": False
@@ -99,7 +174,31 @@ class AttendanceTracker:
         """
         current_time = time.time()
         
+        if not self.active:
+            return
+        
         with self.lock:
+            # --- TIME JUMP / SLEEP DETECTION ---
+            # If the last check was > 5 seconds ago (loop should run every 1s),
+            # the computer likely went to sleep or process hung.
+            # We must PAUSE the absence timers by shifting 'last_seen' forward.
+            time_diff = current_time - self.last_check_time
+            self.last_check_time = current_time
+            
+            if time_diff > 5.0:
+                print(f"  ⚠ System time jump detected ({time_diff:.1f}s). Computer likely slept.")
+                print("    → Adjusting absence timers to prevent false positive...")
+                
+                # Add the 'slept' duration to last_seen for everyone
+                # This effectively ignores the time spent sleeping
+                compensate = time_diff - 1.0 # Subtract expected 1s interval
+                for data in self.tracked_people.values():
+                    if data["status"] == "present":
+                        data["last_seen"] += compensate
+                
+                # Skip detection this cycle (allow cameras to reconnect)
+                return
+
             for person_name, data in self.tracked_people.items():
                 if data["status"] == "present":
                     time_since_seen = current_time - data["last_seen"]
@@ -111,18 +210,15 @@ class AttendanceTracker:
                             data["absence_notified"] = True
                             
                             # Save evidence with composite image
-                            # BUG FIX: Get current frame from the SAME camera that last saw the person
-                            evidence_frame = current_frame
-                            evidence_camera = current_camera
+                            # FIXED: ALWAYS get current frame from the SAME camera that last saw the person
+                            evidence_frame = None
+                            evidence_camera = data["last_camera"]
                             
-                            if self.camera_frame_getter and data["last_camera"] != current_camera:
-                                # Try to get frame from the correct camera
+                            if self.camera_frame_getter:
                                 try:
-                                    correct_frame = self.camera_frame_getter(data["last_camera"])
-                                    if correct_frame is not None:
-                                        evidence_frame = correct_frame
-                                        evidence_camera = data["last_camera"]
-                                        print(f"  → Retrieved correct frame from {evidence_camera} for absence evidence")
+                                    evidence_frame = self.camera_frame_getter(data["last_camera"])
+                                    if evidence_frame is not None:
+                                        print(f"  → Got current frame from {evidence_camera} for absence evidence")
                                 except Exception as e:
                                     print(f"  ⚠ Failed to get frame from {data['last_camera']}: {e}")
 
@@ -189,10 +285,16 @@ class AttendanceTracker:
         if current_frame is not None:
             right_img = current_frame.copy()
         else:
-            # Fallback: use last frame with "CURRENT" text overlay
+            # Fallback: use last frame with warning overlay (camera may be disconnected)
             right_img = last_frame.copy()
-            cv2.putText(right_img, "NO CURRENT FRAME", (50, 100), 
-                       cv2.FONT_HERSHEY_SIMPLEX, 1.5, (0, 0, 255), 3)
+            # Draw semi-transparent overlay
+            overlay = right_img.copy()
+            cv2.rectangle(overlay, (0, 0), (right_img.shape[1], right_img.shape[0]), (0, 0, 100), -1)
+            right_img = cv2.addWeighted(overlay, 0.3, right_img, 0.7, 0)
+            cv2.putText(right_img, "CAMERA OFFLINE", (50, right_img.shape[0]//2), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 0, 255), 3)
+            cv2.putText(right_img, "(Using last frame)", (50, right_img.shape[0]//2 + 40), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, (200, 200, 200), 2)
         
         # Resize both to same height for side-by-side
         target_height = 480

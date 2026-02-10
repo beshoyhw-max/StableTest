@@ -142,6 +142,18 @@ skip_frames = st.sidebar.slider(
 )
 manager.update_skip_frames(skip_frames)
 
+# Sync thresholds to file for Production mode
+from config_sync import save_thresholds
+save_thresholds(
+    conf=conf_threshold,
+    phone_dur=phone_duration,
+    sleep_dur=sleep_duration,
+    cooldown=cooldown_duration,
+    absence=absence_threshold,
+    skip_frames=skip_frames,
+    sleep_sensitivity=sleep_sensitivity
+)
+
 st.sidebar.markdown("---")
 st.sidebar.info(f"Active Cameras: {len(manager.get_active_cameras())}")
 
@@ -202,6 +214,29 @@ if page_selection == "🔴 Live Dashboard":
                 launch_viewer(manager)
                 st.success("Native viewer opened! Press 'Q' to close it.")
     
+    # Production Mode Button (Multiprocessing)
+    from production_viewer import launch_production_mode, stop_production_mode, is_production_running
+    
+    prod_col1, prod_col2 = st.columns([3, 1])
+    with prod_col1:
+        st.warning("⚡ **Production Mode:** Runs with multiprocessing (2x faster). Opens in new window. Press 'Q' to return.")
+    with prod_col2:
+        if is_production_running():
+            if st.button("🛑 Stop Production", type="secondary", key="stop_prod"):
+                success, msg = stop_production_mode()
+                if success:
+                    st.success(msg)
+                else:
+                    st.error(msg)
+                st.rerun()
+        else:
+            if st.button("⚡ Launch Production", type="primary", key="launch_prod"):
+                success, msg = launch_production_mode(manager)
+                if success:
+                    st.success(f"🚀 {msg}")
+                else:
+                    st.error(msg)
+    
     # Who Left Panel - Separate section for absent people
     absent_people = manager.get_absent_people()
     if absent_people:
@@ -240,6 +275,11 @@ if page_selection == "🔴 Live Dashboard":
         
         if run_monitor:
             while True:
+                # Check if cameras were restarted in background (after production mode exit)
+                from production_viewer import check_rerun_signal
+                if check_rerun_signal():
+                    st.rerun()
+                
                 loop_texting = []
                 loop_sleeping = []
                 
