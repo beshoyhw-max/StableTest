@@ -206,6 +206,11 @@ class FaceRecognizer:
             self.detector.setScoreThreshold(old_threshold)
         
         # Attempt 3: Try on slightly larger context if roi is small
+        # BUG-4 FIX: Use context_roi directly for alignment instead of mapping
+        # coordinates back to roi (which could produce negative/out-of-bounds values)
+        use_context_roi = False
+        context_roi = None
+        
         if len(faces) == 0 and (x2 - x1) < 150:
             # Expand search area
             ctx1 = max(0, x1 - 30)
@@ -220,13 +225,10 @@ class FaceRecognizer:
             faces_ctx = self.detect_faces(context_roi)
             self.detector.setScoreThreshold(old_threshold)
             
-            # Adjust face coordinates back to original roi space
             if len(faces_ctx) > 0:
-                for face_ctx in faces_ctx:
-                    adjusted_face = face_ctx.copy()
-                    adjusted_face[0] = face_ctx[0] - (ctx1 - x1)
-                    adjusted_face[1] = face_ctx[1] - (cty1 - y1)
-                    faces.append(adjusted_face)
+                # Keep faces in context_roi coordinate space for correct alignment
+                faces = list(faces_ctx)
+                use_context_roi = True
         
         if len(faces) == 0:
             return "Unknown", 0.0
@@ -242,9 +244,12 @@ class FaceRecognizer:
         if face_w < 25 or face_h < 25:
             return "Unknown", 0.0
         
+        # Select correct image for alignment (must match face coordinate space)
+        align_source = context_roi if use_context_roi else roi
+        
         try:
             # Align face
-            aligned_face = self.recognizer.alignCrop(roi, face)
+            aligned_face = self.recognizer.alignCrop(align_source, face)
             
             if aligned_face is None or aligned_face.size == 0:
                 return "Unknown", 0.0

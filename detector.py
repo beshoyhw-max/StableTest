@@ -3,9 +3,11 @@ import time
 import os
 import math
 import datetime
+import gc
 from ultralytics import YOLO
 import threading
 from sleep_detector import SleepDetector
+from async_sleep_worker import AsyncSleepWorker
 import torch
 import numpy as np
 class PhoneDetector:
@@ -36,8 +38,6 @@ class PhoneDetector:
             os.makedirs(self.output_dir)
 
         # Load models
-        # OPTIMIZATION: Split lock into detection and pose locks
-        # If model_instance is None (Private Model), we DO NOT LOCK detection -> Parallel Inference!
         self.pose_lock = lock
         
         if model_instance:
@@ -47,7 +47,6 @@ class PhoneDetector:
         else:
             print(f"  → Loading private detection model from {model_path}")
             self.model = YOLO(model_path, task='detect')
-            # TensorRT models don't support .to(device)
             if model_path.endswith('.pt'):
                 self.model.to(self.device)
             print("  → Private detection model loaded - PARALLEL INFERENCE ENABLED")
@@ -59,9 +58,15 @@ class PhoneDetector:
         else:
             self.sleep_detector = SleepDetector(pose_model_path=pose_model_path, lock=lock)
         print("  → Sleep detector initialized")
+        
+        # Initialize async sleep worker (moves MediaPipe off main loop)
+        self.async_sleep_worker = AsyncSleepWorker(self.sleep_detector)
+        self.async_sleep_worker.start()
+        print("  → Async sleep worker started")
 
         # Initialize face recognition if enabled
         self.face_recognizer = None
+        self.async_face_worker = None  # BUG-1 FIX: Always initialize to prevent AttributeError
         self.enable_face_recognition = enable_face_recognition
         
         if enable_face_recognition:
@@ -94,13 +99,10 @@ class PhoneDetector:
         self.reset_gap = reset_gap
         
         # Tracking state
-        self.cooldown_seconds = cooldown_seconds
-        self.reset_gap = reset_gap
-        
-        # Tracking state
         self.violation_timers = {}
         self.cooldowns = {}  # Local cooldowns for unknown persons (per-camera)
         self.last_display_data = []
+        self.display_data_lock = threading.Lock()  # Thread-safe access to display data
         
         # HYBRID COOLDOWN: Shared cooldowns for recognized persons (global)
         self.shared_cooldowns = shared_cooldowns  # Shared dict from CameraManager
@@ -140,8 +142,8 @@ class PhoneDetector:
         """
         current_time = time.time()
         
-        # Periodic cleanup
-        if frame_count % 1000 == 0:
+        # Periodic cleanup - every 300 frames (~10s at 30fps) for faster memory recovery
+        if frame_count % 300 == 0:
             cutoff = current_time - (self.cooldown_seconds * 2)
             self.cooldowns = {k: v for k, v in self.cooldowns.items() if v > cutoff}
             
@@ -168,12 +170,14 @@ class PhoneDetector:
                 k: v for k, v in self.identity_missed_counts.items()
                 if k in self.person_identities or k in active_track_ids
             }
+            
+            # Trigger garbage collection to reclaim memory from cleaned dicts
+            gc.collect()
 
         global_status = "safe"
         screenshot_saved_global = False
 
         # --- INFERENCE STEP ---
-        # Convert to grayscale for Optical Flow (always needed now)
         gray_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         
         if frame_count % skip_frames == 0:
@@ -202,9 +206,6 @@ class PhoneDetector:
             phone_boxes = []
 
             if len(results) > 0 and results[0].boxes:
-                # DEBUG: Check if it's YOLO detecting it
-                # Logic used for debug prints removed for performance
-
                 for box in results[0].boxes:
                     cls_id = int(box.cls[0].item())
                     coords = box.xyxy[0].cpu().numpy()
@@ -218,7 +219,6 @@ class PhoneDetector:
                         w = coords[2] - coords[0]
                         h = coords[3] - coords[1]
                         aspect_ratio = w / h if h > 0 else 0
-                        # print(f"DEBUG: AR: {aspect_ratio:.2f} | Conf: {float(box.conf[0].item()):.2f}")
                         
                         # Data-driven update:
                         # Pen AR seen: 0.14 - 0.33 -> Cutoff: 0.45
@@ -270,15 +270,11 @@ class PhoneDetector:
                     confidence = res['conf']
                     
                     if person_name != "Unknown" and confidence >= self.identity_min_confidence:
-                        old_name = self.person_identities.get(track_id, "Unknown")
                         self.person_identities[track_id] = person_name
                         self.identity_confidences[track_id] = confidence
                         
                         # Reset missed count on success
                         self.identity_missed_counts[track_id] = 0
-                        
-                        if old_name != person_name:
-                            print(f"  ✓ ID {track_id}: {person_name} ({confidence:.3f})")
                         
                         # Update attendance tracker with recognized person
                         # NOTE: This is safe to call here as it just updates a dict (fast)
@@ -294,7 +290,7 @@ class PhoneDetector:
                             
                             if current_box is not None:
                                 self.attendance_tracker.update_person(
-                                    person_name, current_box, frame, camera_name
+                                    person_name, current_box, frame, camera_name, confidence
                                 )
                     else:
                         # Not recognized (Unknown or low confidence)
@@ -304,10 +300,9 @@ class PhoneDetector:
                             self.identity_missed_counts[track_id] = misses
                             
                             if misses >= self.identity_miss_threshold:
-                                removed_name = self.person_identities.pop(track_id, "Unknown")
+                                self.person_identities.pop(track_id, None)
                                 self.identity_confidences.pop(track_id, None)
                                 self.identity_missed_counts[track_id] = 0
-                                print(f"  ✕ ID {track_id}: Identity '{removed_name}' dropped (failed {misses} verifications)")
 
 
                 # B. QUEUE NEW REQUESTS
@@ -329,11 +324,12 @@ class PhoneDetector:
                 x1, y1, x2, y2, track_id = map(int, p_box)
 
                 # Determine current frame status
-                has_phone = phone_map.get(track_id, False)
+                phone_box_data = phone_map.get(track_id, None)
+                has_phone = phone_box_data is not None
                 is_sleeping = False
                 
                 if not has_phone and enable_sleep_detection:
-                    # Check for sleep
+                    # Check for sleep (ASYNC: enqueue + cache lookup)
                     h, w, _ = frame.shape
                     pad = 20
                     cx1 = max(0, x1 - pad)
@@ -343,17 +339,18 @@ class PhoneDetector:
                     person_crop = frame[cy1:cy2, cx1:cx2]
                     
                     if person_crop.size > 0:
-                        # FIXED: Use Person Name if available (Stable), otherwise used ID (Unstable)
+                        # Use Person Name if available (Stable), otherwise use ID (Unstable)
                         person_name = self.person_identities.get(track_id, None)
                         if person_name:
-                            sleep_key = f"{camera_name}_{person_name}"
-                            # if frame_count % 30 == 0: print(f"DEBUG: Using STABLE key: {sleep_key}")
+                            # LOGIC-6 FIX: Use person_name only (no camera prefix)
+                            # so EAR calibration persists when person moves between cameras
+                            sleep_key = f"person_{person_name}"
                         else:
                             sleep_key = f"{camera_name}_id_{track_id}"
-                            # if frame_count % 30 == 0: print(f"DEBUG: Using ID key: {sleep_key}")
                         kpts = pose_keypoints_map.get(track_id)
                         
-                        sleep_status, sleep_details = self.sleep_detector.process_crop(
+                        # ASYNC PATTERN: Enqueue for background processing
+                        self.async_sleep_worker.enqueue(
                             person_crop,
                             id_key=sleep_key,
                             keypoints=kpts,
@@ -361,14 +358,12 @@ class PhoneDetector:
                             sensitivity=sleep_sensitivity
                         )
                         
-                        if sleep_status in ("sleeping", "drowsy"):
-                            is_sleeping = True
-                
-                # DEBUG: Check if phone is blocking sleep
-                # elif has_phone:
-                #     if frame_count % 30 == 0:
-                #         print(f"DEBUG: ID {track_id} has phone -> Sleep Check SKIPPED")
+                        # Read cached result (instant, non-blocking)
+                        cached_status, cached_details = self.async_sleep_worker.get_sleep_status(sleep_key)
+                        
 
+                        if cached_status in ("sleeping", "drowsy"):
+                            is_sleeping = True
 
                 # --- TIME-BASED VIOLATION TRACKING ---
                 if has_phone:
@@ -382,6 +377,12 @@ class PhoneDetector:
                         }
                     else:
                         self.violation_timers[key]['last_seen'] = current_time
+                    
+                    # LOGIC-1 FIX: Actively clear sleep timer when phone is detected
+                    # Prevents silent sleep duration accumulation during phone usage
+                    sleep_key_to_clear = (track_id, "sleeping")
+                    if sleep_key_to_clear in self.violation_timers:
+                        del self.violation_timers[sleep_key_to_clear]
                 
                 if is_sleeping:
                     key = (track_id, "sleeping")
@@ -406,6 +407,9 @@ class PhoneDetector:
             for p_box in person_boxes:
                 x1, y1, x2, y2, track_id = map(int, p_box)
                 
+                # Re-extract phone box for THIS person (needed for evidence screenshot)
+                phone_box_data = phone_map.get(track_id, None)
+                
                 status = "safe"
                 color = (0, 255, 0)
                 
@@ -417,7 +421,7 @@ class PhoneDetector:
                     # Show name with confidence
                     label = f"{person_name} ({person_conf:.2f})"
                 else:
-                    label = f"ID: {track_id}"
+                    label = ""
                 
                 # Check texting timer
                 texting_key = (track_id, "texting")
@@ -433,10 +437,12 @@ class PhoneDetector:
                         status = "texting"
                         color = (0, 0, 255)
                         global_status = "texting"
-                        label += f" | PHONE {texting_duration:.1f}s"
+                        sep = " | " if label else ""
+                        label += f"{sep}PHONE {texting_duration:.1f}s"
                     else:
                         color = (0, 165, 255)
-                        label += f" | Phone {texting_duration:.1f}s/{self.phone_duration_threshold:.0f}s"
+                        sep = " | " if label else ""
+                        label += f"{sep}Phone {texting_duration:.1f}s/{self.phone_duration_threshold:.0f}s"
                 
                 elif sleeping_key in self.violation_timers:
                     sleeping_duration = current_time - self.violation_timers[sleeping_key]['start_time']
@@ -446,10 +452,12 @@ class PhoneDetector:
                         color = (255, 0, 0)
                         if global_status != "texting":
                             global_status = "sleeping"
-                        label += f" | SLEEP {sleeping_duration:.1f}s"
+                        sep = " | " if label else ""
+                        label += f"{sep}SLEEP {sleeping_duration:.1f}s"
                     else:
                         color = (0, 255, 255)
-                        label += f" | Sleep {sleeping_duration:.1f}s/{self.sleep_duration_threshold:.0f}s"
+                        sep = " | " if label else ""
+                        label += f"{sep}Sleep {sleeping_duration:.1f}s/{self.sleep_duration_threshold:.0f}s"
 
                 # --- SAVE EVIDENCE with HYBRID COOLDOWN ---
                 # Recognized persons: Global cooldown (1 screenshot across ALL cameras)
@@ -461,8 +469,16 @@ class PhoneDetector:
                     if person_name:
                         # RECOGNIZED PERSON: Use global shared cooldowns
                         key = (person_name, status)
-                        if self.shared_cooldowns is not None and self.shared_cooldowns_lock is not None:
-                            with self.shared_cooldowns_lock:
+                        if self.shared_cooldowns is not None:
+                            # Manager.dict() is process-safe, lock is optional
+                            if self.shared_cooldowns_lock is not None:
+                                with self.shared_cooldowns_lock:
+                                    last_save_time = self.shared_cooldowns.get(key, 0)
+                                    if (current_time - last_save_time) > self.cooldown_seconds:
+                                        should_save = True
+                                        self.shared_cooldowns[key] = current_time
+                            else:
+                                # No lock needed (Manager.dict() case)
                                 last_save_time = self.shared_cooldowns.get(key, 0)
                                 if (current_time - last_save_time) > self.cooldown_seconds:
                                     should_save = True
@@ -475,7 +491,9 @@ class PhoneDetector:
                                 self.cooldowns[key] = current_time
                     else:
                         # UNKNOWN PERSON: Use per-camera local cooldowns
-                        key = (f"id_{track_id}", status)
+                        # LOGIC-3 FIX: Include camera_name to prevent track ID reuse collisions
+                        # across cameras (YOLO reuses IDs after someone leaves frame)
+                        key = (f"{camera_name}_id_{track_id}", status)
                         last_save_time = self.cooldowns.get(key, 0)
                         if (current_time - last_save_time) > self.cooldown_seconds:
                             should_save = True
@@ -490,33 +508,39 @@ class PhoneDetector:
                         self.save_evidence(
                             raw_evidence_frame, x1, y1, x2, y2, camera_name, 
                             type_str, track_id=track_id, duration=duration_str,
-                            person_name=person_name
+                            person_name=person_name,
+                            phone_box=phone_box_data if status == "texting" else None
                         )
                         screenshot_saved_global = True
                         label += " [SAVED]"
 
                 new_display_data.append((x1, y1, x2, y2, color, status, label))
 
-            # Update global display data
+            # --- DEBUG: VISUALIZE ALL DETECTED PHONES ---
+            for ph_box in phone_boxes:
+                # ph_box is (x1, y1, x2, y2, conf)
+                px1, py1, px2, py2, p_conf = ph_box
+                # Use Yellow/Cyan for phones to distinguish from Red/Green/Blue person boxes
+                # (0, 255, 255) is Yellow in BGR
+                new_display_data.append((int(px1), int(py1), int(px2), int(py2), (0, 0, 255), "phone_debug", f"Phone"))
+
             # NOTE: We update self.last_display_data only on inference to keep it authoritative
             # Optical flow will update it efficiently on skipped frames
-            self.last_display_data = new_display_data
+            with self.display_data_lock:
+                self.last_display_data = new_display_data
             
             # Update previous gray frame for next optical flow step
             self.prev_gray = gray_frame
             
-            # Check for absences call REMOVED - Moved to CameraManager global loop
-            # if self.attendance_tracker:
-            #     self.attendance_tracker.check_absences(frame, camera_name)
-            
-            # Print FPS
-            # fps = 1.0 / (time.time() - start_infer)
-            # print(f"DEBUG: Processing FPS: {fps:.1f}")
-            
+
         else:
             # --- SKIPPED FRAME: OPTICAL FLOW INTERPOLATION ---
             # If we have previous boxes and a previous frame, we can track movement
-            if self.last_display_data and self.prev_gray is not None:
+            with self.display_data_lock:
+                has_data = len(self.last_display_data) > 0
+                display_data_snapshot = list(self.last_display_data) if has_data else []
+            
+            if has_data and self.prev_gray is not None:
                 try:
                     # Calculate Optical Flow for center points of boxes
                     # This is much faster than full inference
@@ -525,8 +549,8 @@ class PhoneDetector:
                     points = []
                     boxes_idx = []
                     
-                    for i, data in enumerate(self.last_display_data):
-                        x1, y1, x2, y2, _, _, _ = data
+                    for i, data in enumerate(display_data_snapshot):
+                        x1, y1, x2, y2 = data[:4]
                         cx = (x1 + x2) / 2.0
                         cy = (y1 + y2) / 2.0
                         points.append([[cx, cy]])
@@ -549,8 +573,8 @@ class PhoneDetector:
                         for i, (new_p, valid) in enumerate(zip(p1, valid_points)):
                             if valid:
                                 idx = boxes_idx[i]
-                                old_data = self.last_display_data[idx]
-                                x1, y1, x2, y2, color, status, label = old_data
+                                old_data = display_data_snapshot[idx]
+                                x1, y1, x2, y2, color, status, label = old_data[:7]
                                 
                                 # Calculate displacement (dx, dy)
                                 dx = new_p[0][0] - p0[i][0][0]
@@ -572,12 +596,12 @@ class PhoneDetector:
                                 updated_data.append((nx1, ny1, nx2, ny2, color, status, label))
                             else:
                                 # Tracking failed for this point, keep old box
-                                updated_data.append(self.last_display_data[boxes_idx[i]])
+                                updated_data.append(display_data_snapshot[boxes_idx[i]])
                         
-                        self.last_display_data = updated_data
+                        with self.display_data_lock:
+                            self.last_display_data = updated_data
                         
-                except Exception as e:
-                    # print(f"Optical Flow Error: {e}")
+                except Exception:
                     pass
             
             # Update previous gray frame
@@ -594,7 +618,43 @@ class PhoneDetector:
         Get cached detection data for drawing on any frame.
         Returns list of tuples: (x1, y1, x2, y2, color, status, label)
         """
-        return self.last_display_data.copy()
+        with self.display_data_lock:
+            return list(self.last_display_data)
+    
+    def get_recognized_persons(self):
+        """
+        Get recognized persons data for inter-process communication.
+        Used by MPCameraThread to update AttendanceTracker in main process.
+        
+        Returns list of dicts: [{name, box, track_id, confidence}, ...]
+        """
+        result = []
+        # Thread-safe copy of display data
+        with self.display_data_lock:
+            display_data_copy = list(self.last_display_data)
+        
+        for track_id, name in self.person_identities.items():
+            if name and name != "Unknown":
+                conf = self.identity_confidences.get(track_id, 0.0)
+                # Find the box by EXACT name prefix match (fixes "John" matching "Johnny")
+                # Label format: "Name (conf)" or "Name (conf) | Status"
+                box = None
+                for data in display_data_copy:
+                    x1, y1, x2, y2 = data[:4]
+                    label = data[6] if len(data) >= 7 else ""
+                    # Exact prefix match: label starts with "Name (" or "Name |"
+                    if label.startswith(f"{name} (") or label.startswith(f"{name} |"):
+                        box = (x1, y1, x2, y2)
+                        break
+                
+                if box is not None:
+                    result.append({
+                        'name': name,
+                        'box': box,
+                        'track_id': track_id,
+                        'confidence': conf
+                    })
+        return result
     
     def draw_detections_on_frame(self, frame):
         """
@@ -619,39 +679,43 @@ class PhoneDetector:
         font_scale = max(0.6, base_font_scale * scale_factor)
         font_thick = max(1, int(base_font_thickness * scale_factor))
         
-        for (x1, y1, x2, y2, color, status, label) in self.last_display_data:
+        # Thread-safe copy
+        with self.display_data_lock:
+            display_data_copy = list(self.last_display_data)
+        
+        for data in display_data_copy:
+            # Handle both 7-element (legacy) and 8-element (with track_id) tuples
+            x1, y1, x2, y2, color, status, label = data[:7]
             # Draw Box
             cv2.rectangle(output, (x1, y1), (x2, y2), color, box_thickness)
             
-            # Label Calculation
-            label_size, baseline = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, font_scale, font_thick)
-            label_w, label_h = label_size
-            
-            # Dynamic Padding
-            pad_x = int(6 * scale_factor)
-            pad_y = int(6 * scale_factor)
-            
-            # Check if label fits on top, else put inside or below
-            label_y_top = y1 - pad_y
-            if label_y_top - label_h < 0:
-                # If off-screen at top, move inside the box
-                label_y_top = y1 + label_h + pad_y + box_thickness
-            
-            # Draw Background
-            # (x1, y1 - label_h - pad_y) to (x1 + label_w + pad_x, y1)
-            # Adjusted for the calculated position
-            bg_p1 = (x1, label_y_top - label_h - pad_y)
-            bg_p2 = (x1 + label_w + pad_x * 2, label_y_top + pad_y)
-            
-            cv2.rectangle(output, bg_p1, bg_p2, color, -1)
-            
-            # Draw Text
-            cv2.putText(output, label, (x1 + pad_x, label_y_top), 
-                       cv2.FONT_HERSHEY_SIMPLEX, font_scale, (255, 255, 255), font_thick)
+            # Only draw label if there's text to show
+            if label:
+                # Label Calculation
+                label_size, baseline = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, font_scale, font_thick)
+                label_w, label_h = label_size
+                
+                # Dynamic Padding
+                pad_x = int(6 * scale_factor)
+                pad_y = int(6 * scale_factor)
+                
+                # Check if label fits on top, else put inside or below
+                label_y_top = y1 - pad_y
+                if label_y_top - label_h < 0:
+                    # If off-screen at top, move inside the box
+                    label_y_top = y1 + label_h + pad_y + box_thickness
+                
+                # Draw Background
+                bg_p1 = (x1, label_y_top - label_h - pad_y)
+                bg_p2 = (x1 + label_w + pad_x * 2, label_y_top + pad_y)
+                
+                cv2.rectangle(output, bg_p1, bg_p2, color, -1)
+                
+                # Draw Text
+                cv2.putText(output, label, (x1 + pad_x, label_y_top), 
+                           cv2.FONT_HERSHEY_SIMPLEX, font_scale, (255, 255, 255), font_thick)
         
         return output
-
-        return mapping
 
     def _associate_phones_to_persons(self, person_boxes, phone_boxes, pose_keypoints_map):
         """
@@ -687,50 +751,49 @@ class PhoneDetector:
                 raw_dist = float('inf')
 
                 # --- 1. GEOMETRIC FILTER: IGNORE HAND-ON-FACE ---
-                # Check if "phone" is centrally located on the face (likely a hand)
-                if kpts is not None:
-                    nose = kpts[0]      # [x, y, conf]
-                    shoulder_l = kpts[5]
-                    shoulder_r = kpts[6]
-                    
-                    # Ensure Nose is detected
-                    if nose[0] > 0:
-                        nose_x, nose_y = nose[:2]
-                        
-                        # Calculate Face Width Heuristic (distance between ears or scaled from person width)
-                        # Fallback: 20% of person width
-                        face_width_est = person_width * 0.20
-                        
-                        # Check Horizontal Alignment: Is phone "Central"?
-                        # Real phone calls are at the EAR (offset from nose).
-                        # Hands on face are usually overlapping the Nose/Mouth (central).
-                        dist_x_nose = abs(ph_cx - nose_x)
-                        
-                        is_central_x = dist_x_nose < (face_width_est * 0.8) # Stricter margin means we only filter VERY central things
-                        
-                        # Check Vertical Alignment: Is phone "High"?
-                        # Phone Texting is usually below shoulders or at chest.
-                        # Hand on face is at nose level or slightly below.
-                        
-                        # Get Shoulder Y (higher value is lower on screen)
-                        shoulder_y = float('inf')
-                        if shoulder_l[0] > 0 and shoulder_r[0] > 0:
-                            shoulder_y = (shoulder_l[1] + shoulder_r[1]) / 2
-                        elif shoulder_l[0] > 0:
-                            shoulder_y = shoulder_l[1]
-                        elif shoulder_r[0] > 0:
-                            shoulder_y = shoulder_r[1]
-                        else:
-                            # Fallback if no shoulders: use chest estimate
-                            shoulder_y = p_y1 + person_height * 0.25 # Approximation
-                            
-                        # If phone is ABOVE the shoulders (or reasonably high)
-                        is_high_y = ph_cy < shoulder_y
-                        
-                        if is_central_x and is_high_y:
-                            # It's HIGH and CENTRAL -> Likely Hand on Face / Facepalm
-                            # print(f"DEBUG: Filtered Hand-on-Face ID {p_id}. DistX: {dist_x_nose:.1f}")
-                            continue
+                # DISABLED: Commenting out to allow phone detection even when phone is in middle of face
+                # TODO: Re-enable when false positive filtering is refined
+                # if kpts is not None:
+                #     nose = kpts[0]      # [x, y, conf]
+                #     shoulder_l = kpts[5]
+                #     shoulder_r = kpts[6]
+                #     
+                #     # Ensure Nose is detected
+                #     if nose[0] > 0:
+                #         nose_x, nose_y = nose[:2]
+                #         
+                #         # Calculate Face Width Heuristic (distance between ears or scaled from person width)
+                #         # Fallback: 20% of person width
+                #         face_width_est = person_width * 0.20
+                #         
+                #         # Check Horizontal Alignment: Is phone "Central"?
+                #         # Real phone calls are at the EAR (offset from nose).
+                #         # Hands on face are usually overlapping the Nose/Mouth (central).
+                #         dist_x_nose = abs(ph_cx - nose_x)
+                #         
+                #         is_central_x = dist_x_nose < (face_width_est * 0.8)
+                #         
+                #         # Check Vertical Alignment: Is phone "High"?
+                #         # Phone Texting is usually below shoulders or at chest.
+                #         # Hand on face is at nose level or slightly below.
+                #         
+                #         # Get Shoulder Y (higher value is lower on screen)
+                #         shoulder_y = float('inf')
+                #         if shoulder_l[0] > 0 and shoulder_r[0] > 0:
+                #             shoulder_y = (shoulder_l[1] + shoulder_r[1]) / 2
+                #         elif shoulder_l[0] > 0:
+                #             shoulder_y = shoulder_l[1]
+                #         elif shoulder_r[0] > 0:
+                #             shoulder_y = shoulder_r[1]
+                #         else:
+                #             # Fallback if no shoulders: use chest estimate
+                #             shoulder_y = p_y1 + person_height * 0.25
+                #             
+                #         # If phone is ABOVE the shoulders (or reasonably high)
+                #         is_high_y = ph_cy < shoulder_y
+                #         
+                #         if is_central_x and is_high_y:
+                #             continue
                             
                 # --- 2. REGULAR ASSOCIATION ---
                 if kpts is not None:
@@ -766,10 +829,10 @@ class PhoneDetector:
                     min_normalized_dist = normalized_dist
                     best_person_id = p_id
 
-            MAX_NORMALIZED_DISTANCE = 0.6
+            MAX_NORMALIZED_DISTANCE = 0.4
             
             if best_person_id is not None and min_normalized_dist < MAX_NORMALIZED_DISTANCE:
-                mapping[best_person_id] = True
+                mapping[best_person_id] = (int(ph_x1), int(ph_y1), int(ph_x2), int(ph_y2))
 
         return mapping
 
@@ -807,7 +870,8 @@ class PhoneDetector:
         return mapping
 
     def save_evidence(self, frame, x1, y1, x2, y2, camera_name="Unknown", 
-                     detection_type="PHONE", track_id=None, duration="N/A", person_name=None):
+                     detection_type="PHONE", track_id=None, duration="N/A", person_name=None,
+                     phone_box=None):
         """
         Save evidence screenshot with duration and person name metadata.
         Organizes files into folders: detections/<type>/<person_name>/
@@ -817,6 +881,13 @@ class PhoneDetector:
         evidence_img = frame.copy()
         box_color = (0, 0, 255) if detection_type == "PHONE" else (255, 0, 0)
         cv2.rectangle(evidence_img, (x1, y1), (x2, y2), box_color, 3)
+        
+        # Draw phone bounding box (yellow) if available
+        if phone_box is not None:
+            px1, py1, px2, py2 = phone_box
+            cv2.rectangle(evidence_img, (px1, py1), (px2, py2), (0, 255, 255), 2)
+            cv2.putText(evidence_img, "PHONE", (px1, py1 - 5),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 2)
         
         ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         cv2.rectangle(evidence_img, (0, 0), (evidence_img.shape[1], 40), (0,0,0), -1)

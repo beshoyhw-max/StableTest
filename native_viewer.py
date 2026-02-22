@@ -29,11 +29,31 @@ class NativeVideoViewer:
         self.window_name = window_name
         self.running = False
         self.thread = None
-        self.grid_width = 1920
-        self.grid_height = 1080
+        
+        # Auto-detect screen resolution for optimal display
+        screen_w, screen_h = self._get_screen_resolution()
+        # Leave some margin for taskbar/title bar
+        self.grid_width = int(screen_w * 0.92)
+        self.grid_height = int(screen_h * 0.88)
+        print(f"[NativeViewer] Screen: {screen_w}x{screen_h} → Window target: {self.grid_width}x{self.grid_height}")
         
         # View mode: 'detection' (with boxes) or 'raw' (no boxes)
         self.view_mode = 'detection'
+    
+    @staticmethod
+    def _get_screen_resolution():
+        """Detect primary monitor resolution using Windows API."""
+        try:
+            import ctypes
+            user32 = ctypes.windll.user32
+            user32.SetProcessDPIAware()  # Handle DPI scaling
+            w = user32.GetSystemMetrics(0)
+            h = user32.GetSystemMetrics(1)
+            if w > 0 and h > 0:
+                return w, h
+        except Exception:
+            pass
+        return 1920, 1080  # Fallback
         
     def start(self):
         """Start the viewer in a background thread."""
@@ -97,23 +117,19 @@ class NativeVideoViewer:
             pass
         
     def _create_composite(self):
-        """Create a composite grid of all camera feeds with status bar BELOW."""
+        """Create a composite grid of all camera feeds with status bar BELOW.
+        
+        Builds the canvas at the TARGET window resolution (self.grid_width x self.grid_height)
+        so it looks. sharp on any screen. Detection is unaffected (runs on raw frames).
+        """
         active_cams = self.camera_manager.get_active_cameras()
         num_cams = len(active_cams)
         
         if num_cams == 0:
-            frame = np.zeros((720, 1280, 3), dtype=np.uint8)
-            cv2.putText(frame, "No Cameras Connected", (50, 360), 
+            frame = np.zeros((self.grid_height, self.grid_width, 3), dtype=np.uint8)
+            cv2.putText(frame, "No Cameras Connected", (50, self.grid_height // 2), 
                        cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
             return frame
-        
-        # Get first camera's frame to determine source resolution
-        first_cam = list(active_cams.values())[0]
-        sample_frame = first_cam.get_frame()
-        if sample_frame is not None:
-            src_height, src_width = sample_frame.shape[:2]
-        else:
-            src_width, src_height = 1280, 720
         
         # Calculate grid layout
         if num_cams == 1:
@@ -124,18 +140,16 @@ class NativeVideoViewer:
             cols = int(math.ceil(math.sqrt(num_cams)))
             rows = int(math.ceil(num_cams / cols))
         
-        # Grid dimensions
-        grid_width = src_width * cols
-        grid_height = src_height * rows
-        
-        # Add space for status bar at bottom
+        # Build at TARGET window resolution, not raw camera resolution
         status_bar_height = 40
+        cell_width = self.grid_width // cols
+        cell_height = (self.grid_height - status_bar_height) // rows
+        
+        grid_width = cell_width * cols
+        grid_height = cell_height * rows
         total_height = grid_height + status_bar_height
         
-        cell_width = src_width
-        cell_height = src_height
-        
-        # Create composite canvas
+        # Create composite canvas at window-sized resolution
         composite = np.zeros((total_height, grid_width, 3), dtype=np.uint8)
         
         # Fill each cell
@@ -161,10 +175,10 @@ class NativeVideoViewer:
             
             if frame is not None:
                 h, w = frame.shape[:2]
-                if h != cell_height or w != cell_width:
-                    resized = cv2.resize(frame, (cell_width, cell_height))
-                else:
-                    resized = frame
+                # INTER_AREA for downscaling (sharper, anti-aliased)
+                # INTER_CUBIC for upscaling (smoother)
+                interp = cv2.INTER_AREA if (w > cell_width or h > cell_height) else cv2.INTER_CUBIC
+                resized = cv2.resize(frame, (cell_width, cell_height), interpolation=interp)
             else:
                 resized = np.zeros((cell_height, cell_width, 3), dtype=np.uint8)
                 cv2.putText(resized, "No Signal", (10, cell_height // 2), 
@@ -182,7 +196,6 @@ class NativeVideoViewer:
             composite[y_start:y_start + cell_height, x_start:x_start + cell_width] = resized
             
             # Draw Status Text in the Bottom Bar Area (below the video column)
-            # Center the text under the video content
             bar_y = grid_height + 25
             text_x = x_start + 10
             
