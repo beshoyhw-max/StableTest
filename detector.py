@@ -1,4 +1,5 @@
 import cv2
+import cv2_utils
 import time
 import os
 import math
@@ -692,7 +693,7 @@ class PhoneDetector:
             # Only draw label if there's text to show
             if label:
                 # Label Calculation
-                label_size, baseline = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, font_scale, font_thick)
+                label_size, baseline = cv2_utils.get_text_size(label, cv2.FONT_HERSHEY_SIMPLEX, font_scale, font_thick)
                 label_w, label_h = label_size
                 
                 # Dynamic Padding
@@ -711,8 +712,8 @@ class PhoneDetector:
                 
                 cv2.rectangle(output, bg_p1, bg_p2, color, -1)
                 
-                # Draw Text
-                cv2.putText(output, label, (x1 + pad_x, label_y_top), 
+                # Draw Text (Unicode-safe for Chinese names)
+                cv2_utils.put_text(output, label, (x1 + pad_x, label_y_top), 
                            cv2.FONT_HERSHEY_SIMPLEX, font_scale, (255, 255, 255), font_thick)
         
         return output
@@ -900,7 +901,7 @@ class PhoneDetector:
             if track_id is not None: 
                 header_text += f" | ID: {track_id}"
 
-        cv2.putText(evidence_img, header_text, (10, 25), 
+        cv2_utils.put_text(evidence_img, header_text, (10, 25), 
                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
 
         # Filename format: type_camera_MM-DD-HH-MM-SS_personname.jpg

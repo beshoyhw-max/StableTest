@@ -6,6 +6,7 @@ for a configurable time period. Captures evidence with last known position.
 """
 
 import cv2
+import cv2_utils
 import numpy as np
 import os
 import time
@@ -275,10 +276,10 @@ class AttendanceTracker:
         
         # Add "LAST SEEN" label on the box
         label = f"{person_name}"
-        label_size, _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
+        label_size, _ = cv2_utils.get_text_size(label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
         label_w, label_h = label_size
         cv2.rectangle(left_img, (x1, y1 - label_h - 10), (x1 + label_w + 5, y1), box_color, -1)
-        cv2.putText(left_img, label, (x1 + 2, y1 - 5), 
+        cv2_utils.put_text(left_img, label, (x1 + 2, y1 - 5), 
                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
         
         # Prepare current frame (right side)
@@ -318,7 +319,7 @@ class AttendanceTracker:
         duration_str = f"{duration_seconds:.0f}s" if duration_seconds < 60 else f"{duration_seconds/60:.1f}min"
         
         header_text = f"ABSENT: {person_name} | Duration: {duration_str}"
-        cv2.putText(header, header_text, (10, 40), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 255, 255), 2)
+        cv2_utils.put_text(header, header_text, (10, 40), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 255, 255), 2)
         
         # Create sub-headers for each panel
         left_header_height = 30

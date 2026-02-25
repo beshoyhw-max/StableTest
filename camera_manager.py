@@ -1,4 +1,5 @@
 import cv2
+import cv2_utils
 import threading
 import time
 import json
@@ -623,7 +624,7 @@ class MPCameraThread(threading.Thread):
                     
                     # Draw label ONLY if it has content
                     if label:
-                        label_size, baseline = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, font_scale, font_thick)
+                        label_size, baseline = cv2_utils.get_text_size(label, cv2.FONT_HERSHEY_SIMPLEX, font_scale, font_thick)
                         label_w, label_h = label_size
                         
                         pad_x = int(6 * scale_factor)
@@ -637,7 +638,7 @@ class MPCameraThread(threading.Thread):
                         bg_p2 = (int(x1) + label_w + pad_x * 2, label_y_top + pad_y)
                         
                         cv2.rectangle(output, bg_p1, bg_p2, color, -1)
-                        cv2.putText(output, label, (int(x1) + pad_x, label_y_top), 
+                        cv2_utils.put_text(output, label, (int(x1) + pad_x, label_y_top), 
                                    cv2.FONT_HERSHEY_SIMPLEX, font_scale, (255, 255, 255), font_thick)
         
         return output
